@@ -83,6 +83,51 @@ private struct Transferring<Value>: Sendable {
         self.value = value
     }
 }
+
+// ⚠️ Pattern that the region based isolation checker does not understand how to check. Please file a bug
+@available(macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, *)
+public func withThrowingTimeout<T>(
+    isolation: isolated (any Actor)? = #isolation,
+    until instant: ContinuousClock.Instant,
+    tolerance: ContinuousClock.Instant.Duration? = nil,
+    body: () async throws -> sending T
+) async throws -> sending T {
+    let transferringBody = { try await Transferring(body()) }
+    typealias NonSendableClosure = () async throws -> Transferring<T>
+    typealias SendableClosure = @Sendable () async throws -> Transferring<T>
+    return try await withoutActuallyEscaping(transferringBody) {
+        (_ fn: @escaping NonSendableClosure) async throws -> Transferring<T> in
+        let sendableFn = unsafeBitCast(fn, to: SendableClosure.self)
+        return try await _withThrowingTimeout(
+            until: instant,
+            tolerance: tolerance,
+            body: sendableFn
+        )
+    }.value
+}
+
+
+@available(macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, *)
+private func _withThrowingTimeout<T: Sendable>(
+    isolation: isolated (any Actor)? = #isolation,
+    until instant: ContinuousClock.Instant,
+    tolerance: ContinuousClock.Instant.Duration? = nil,
+    body: @Sendable @escaping () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask {
+            try await body()
+        }
+        group.addTask {
+            try await Task.sleep(until: instant, tolerance: tolerance, clock: ContinuousClock())
+            throw TimeoutError(timeout: 1)
+        }
+        let success = try await group.next()!
+        group.cancelAll()
+        return success
+    }
+}
+
 #else
 public func withThrowingTimeout<T>(
     seconds: TimeInterval,
